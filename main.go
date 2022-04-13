@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"time"
 )
 
 type ProcessSettings struct {
@@ -12,8 +14,28 @@ type ProcessSettings struct {
 	FlushAfter int
 }
 
+// ReceivedMessage is the message as received by a transport backend.
+type ReceivedMessage struct {
+	Payload          []byte
+	Attributes       map[string]string
+	ProviderMetadata interface{}
+}
+
 // FirehoseBackend is used for consuming messages from a transport and read/write to storage
 type FirehoseBackend interface {
+	Receive(ctx context.Context, numMessages uint32, visibilityTimeout time.Duration, messageCh chan<- ReceivedMessage) error
+
+	// NackMessage nacks a message on the queue
+	NackMessage(ctx context.Context, providerMetadata interface{}) error
+
+	// AckMessage acknowledges a message on the queue
+	AckMessage(ctx context.Context, providerMetadata interface{}) error
+
+	// RequeueFirehoseDLQ re-queues everything in the firehose queue
+	RequeueFirehoseDLQ(ctx context.Context, numMessages uint32, visibilityTimeout time.Duration) error
+	UploadFile(ctx context.Context, data []byte, uploadBucket string, uploadLocation string) error
+
+	ReadFile(ctx context.Context, readBucket string, readLocation string) ([]byte, error)
 }
 
 type Firehose struct {
