@@ -1,49 +1,26 @@
 package gcp
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"io"
+	"io/ioutil"
 	"time"
 
-	"cloud.google.com/go/pubsub"
-	"github.com/pkg/errors"
-	"golang.org/x/oauth2/google"
-	"google.golang.org/api/option"
+	"cloud.google.com/go/storage"
+	"github.com/cloudchacho/hedwig-go"
+	"github.com/cloudchacho/hedwig-go/gcp"
 )
 
 // This should satify interface for FirehoseBackend
 type Backend struct {
-	client   *pubsub.Client
-	settings Settings
-}
-
-// SubscriptionProject represents a tuple of subscription name and project for cross-project Google subscriptions
-type SubscriptionProject struct {
-	// Subscription name
-	Subscription string
-
-	// ProjectID
-	ProjectID string
-}
-
-func (sp *SubscriptionProject) GetIdentifer() string {
-}
-
-// Metadata is additional metadata associated with a message
-type Metadata struct {
-	// Underlying pubsub message - ack id isn't exported so we have to store this object
-	pubsubMessage *pubsub.Message
-
-	// PublishTime is the time this message was originally published to Pub/Sub
-	PublishTime time.Time
-
-	// DeliveryAttempt is the counter received from Pub/Sub.
-	//    The first delivery of a given message will have this value as 1. The value
-	//    is calculated as best effort and is approximate.
-	DeliveryAttempt int
+	*gcp.Backend
+	firehoseSettings FirehoseSettings
 }
 
 // Settings for Hedwig firehose
-type Settings struct {
+type FirehoseSettings struct {
 	// bucket where leader file is saved
 	MetadataBucket string
 
@@ -52,107 +29,14 @@ type Settings struct {
 
 	// final bucket for firehose files
 	OutputBucket string
+
 	// Firehose queue name, for requeueing
-	QueueName string
-
-	// GoogleCloudProject ID that contains Pub/Sub resources.
-	GoogleCloudProject string
-
-	// PubsubClientOptions is a list of options to pass to pubsub.NewClient. This may be useful to customize GRPC
-	// behavior for example.
-	PubsubClientOptions []option.ClientOption
-
-	// FirehoseSubscriptions is a list of tuples of topic name and GCP project for project topic messages.
-	// Google only.
-	FirehoseSubscriptions []SubscriptionProject
-}
-
-func (b *Backend) initDefaults() {
-	if b.settings.PubsubClientOptions == nil {
-		b.settings.PubsubClientOptions = []option.ClientOption{}
-	}
-}
-
-func (b *Backend) ensureClient(ctx context.Context) error {
-	googleCloudProject := b.settings.GoogleCloudProject
-	if googleCloudProject == "" {
-		creds, err := google.FindDefaultCredentials(ctx)
-		if err != nil {
-			return errors.Wrap(
-				err, "unable to discover google cloud project setting, either pass explicitly, or fix runtime environment")
-		} else if creds.ProjectID == "" {
-			return errors.New(
-				"unable to discover google cloud project setting, either pass explicitly, or fix runtime environment")
-		}
-		googleCloudProject = creds.ProjectID
-	}
-	if b.client != nil {
-		return nil
-	}
-	client, err := pubsub.NewClient(context.Background(), googleCloudProject, b.settings.PubsubClientOptions...)
-	if err != nil {
-		return err
-	}
-	b.client = client
-	return nil
-}
-
-func (b *Backend) Receive(ctx context.Context, queueIdentifier QueueIdentifer, numMessages uint32, visibilityTimeout time.Duration, messageCh chan<- hedwig.ReceivedMessage) {
-	err := b.ensureClient(ctx)
-	if err != nil {
-		return err
-	}
-
-	defer b.client.Close()
-
-	subscription := queueIdentifier.GetIdentifer()
-
-	group, gctx := errgroup.WithContext(ctx)
-
-	pubsubSubscription := b.client.Subscription(subscription)
-	pubsubSubscription.ReceiveSettings.NumGoroutines = 1
-	pubsubSubscription.ReceiveSettings.MaxOutstandingMessages = int(numMessages)
-	if visibilityTimeout != 0 {
-		pubsubSubscription.ReceiveSettings.MaxExtensionPeriod = visibilityTimeout
-	} else {
-		pubsubSubscription.ReceiveSettings.MaxExtensionPeriod = defaultVisibilityTimeoutS
-	}
-	group.Go(func() error {
-		recvErr := pubsubSubscription.Receive(gctx, func(ctx context.Context, message *pubsub.Message) {
-			metadata := Metadata{
-				pubsubMessage:   message,
-				PublishTime:     message.PublishTime,
-				DeliveryAttempt: *message.DeliveryAttempt,
-			}
-			messageCh <- hedwig.ReceivedMessage{
-				Payload:          message.Data,
-				Attributes:       message.Attributes,
-				ProviderMetadata: metadata,
-			}
-		})
-		return recvErr
-	})
-
-	err = group.Wait()
-	if err != nil {
-		return err
-	}
-	// context cancelation doesn't return error in the group
-	return ctx.Err()
-}
-
-func (b *Backend) NackMessage(ctx context.Context, providerMetadata interface{}) error {
-	providerMetadata.(Metadata).pubsubMessage.Nack()
-	return nil
-}
-
-func (b *Backend) AckMessage(ctx context.Context, providerMetadata interface{}) error {
-	providerMetadata.(Metadata).pubsubMessage.Ack()
-	return nil
+	FirehoseQueueName string
 }
 
 // TODO: add when implementing requeue and processing DLQ logijc
-func (b *Backend) RequeueDLQ(ctx context.Context, numMessages uint32, visibilityTimeout time.Duration) error {
+func (b *Backend) RequeueFirehoseDLQ(ctx context.Context, numMessages uint32, visibilityTimeout time.Duration) error {
+	return nil
 }
 
 func (b *Backend) UploadFile(ctx context.Context, data []byte, uploadBucket string, uploadLocation string) error {
@@ -207,8 +91,10 @@ func (b *Backend) ReadFile(ctx context.Context, readBucket string, readLocation 
 
 // NewBackend creates a Firehose on GCP
 // The provider metadata produced by this Backend will have concrete type: gcp.Metadata
-func NewBackend(settings Settings) *Backend {
-	b := &Backend{settings: settings}
-	b.initDefaults()
+func NewBackend(firehoseSettings FirehoseSettings, hedwigSettings gcp.Settings, getLogger hedwig.GetLoggerFunc) *Backend {
+	b := &Backend{
+		gcp.NewBackend(hedwigSettings, getLogger),
+		firehoseSettings,
+	}
 	return b
 }
